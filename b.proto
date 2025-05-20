@@ -1,0 +1,11 @@
+// dummy proto file
+syntax = "proto3";
+package a;
+
+message A {
+  int64 name = 1;
+}
+
+message B {
+  string name = 1;
+}
