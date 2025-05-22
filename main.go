@@ -1,14 +1,30 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
+
+// parseProtoFileToReflect parses a proto file and returns a protoreflect.FileDescriptor
+func parseProtoFileToReflect(filePath string) (protoreflect.FileDescriptor, error) {
+	// Use the ParseProtoFile function from parser.go
+	fileDesc, err := ParseProtoFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert to protoreflect.FileDescriptor
+	return fileDesc.UnwrapFile(), nil
+}
 
 // loadFileDescriptorSet loads a FileDescriptorSet from a file
 func loadFileDescriptorSet(path string) (*descriptorpb.FileDescriptorSet, error) {
@@ -318,115 +334,169 @@ func compareMessages(prevFile, currFile protoreflect.FileDescriptor) []string {
 	return breakingChanges
 }
 
-func main() {
-	if len(os.Args) != 3 {
-		fmt.Println("Usage: go run main.go <prev_fds.pb> <curr_fds.pb>")
-		fmt.Println("")
-		fmt.Println("To generate descriptor files, use protoc:")
-		fmt.Println("  protoc --include_imports --descriptor_set_out=prev_fds.pb your_proto_file.proto")
-		fmt.Println("  protoc --include_imports --descriptor_set_out=curr_fds.pb your_updated_proto_file.proto")
-		os.Exit(1)
+// getModifiedProtoFiles returns a list of proto files with changes compared to the specified commit
+func getModifiedProtoFiles(compareCommit string) ([]string, error) {
+	// First check if the commit exists
+	checkCmd := exec.Command("git", "rev-parse", "--verify", compareCommit)
+	if err := checkCmd.Run(); err != nil {
+		return nil, fmt.Errorf("error: commit '%s' does not exist or is invalid", compareCommit)
 	}
 
-	prevPath := os.Args[1]
-	currPath := os.Args[2]
-
-	// Load file descriptor sets
-	prevSet, err := loadFileDescriptorSet(prevPath)
+	// Get changes compared to the specified commit
+	cmd := exec.Command("git", "diff", "--name-only", compareCommit)
+	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("Error loading previous descriptor set: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("error running git diff: %v", err)
 	}
 
-	currSet, err := loadFileDescriptorSet(currPath)
+	// Filter for .proto files
+	var protoFiles []string
+	files := strings.Split(string(output), "\n")
+	for _, file := range files {
+		if strings.TrimSpace(file) == "" {
+			continue
+		}
+		if filepath.Ext(file) == ".proto" {
+			// Check if the file exists (it might have been deleted)
+			if _, err := os.Stat(file); err == nil {
+				protoFiles = append(protoFiles, file)
+			}
+		}
+	}
+
+	return protoFiles, nil
+}
+
+// getPreviousVersionOfFile gets the previous version of a file from git
+func getPreviousVersionOfFile(file, compareCommit string) (string, error) {
+	// Create a temporary file to store the previous version
+	tmpFile, err := ioutil.TempFile("", "prev_*.proto")
 	if err != nil {
-		fmt.Printf("Error loading current descriptor set: %v\n", err)
-		os.Exit(1)
+		return "", fmt.Errorf("error creating temporary file: %v", err)
 	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
 
-	// Create file descriptor registries
-	prevFiles, err := protodesc.NewFiles(prevSet)
+	// Get the previous version from git
+	cmd := exec.Command("git", "show", compareCommit+":"+file)
+	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("Error creating previous file registry: %v\n", err)
-		os.Exit(1)
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("error getting previous version from git: %v", err)
 	}
 
-	currFiles, err := protodesc.NewFiles(currSet)
+	// Write the previous version to the temporary file
+	if err := ioutil.WriteFile(tmpPath, output, 0644); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("error writing to temporary file: %v", err)
+	}
+
+	return tmpPath, nil
+}
+
+// compareProtoFile compares the current and previous versions of a proto file
+func compareProtoFile(protoFile, compareCommit string) ([]string, error) {
+	fmt.Printf("Analyzing changes in %s...\n", protoFile)
+
+	// Get the previous version of the file
+	prevProtoPath, err := getPreviousVersionOfFile(protoFile, compareCommit)
 	if err != nil {
-		fmt.Printf("Error creating current file registry: %v\n", err)
-		os.Exit(1)
+		return nil, fmt.Errorf("error getting previous version: %v", err)
+	}
+	defer os.Remove(prevProtoPath)
+
+	// Parse proto files directly using protoparse
+	prevFileDesc, err := parseProtoFileToReflect(prevProtoPath)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing previous proto file: %v", err)
 	}
 
-	// Collect all breaking changes
+	currFileDesc, err := parseProtoFileToReflect(protoFile)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing current proto file: %v", err)
+	}
+
+	// Compare the files directly
 	var allBreakingChanges []string
 
-	// Print information about the files
-	fmt.Println("Previous files:")
-	prevFiles.RangeFiles(func(file protoreflect.FileDescriptor) bool {
-		fmt.Printf("  - %s (package: %s)\n", file.Path(), file.Package())
-		return true
-	})
+	// Compare messages
+	msgChanges := compareMessages(prevFileDesc, currFileDesc)
+	allBreakingChanges = append(allBreakingChanges, msgChanges...)
 
-	fmt.Println("Current files:")
-	currFiles.RangeFiles(func(file protoreflect.FileDescriptor) bool {
-		fmt.Printf("  - %s (package: %s)\n", file.Path(), file.Package())
-		return true
-	})
+	// Compare enums
+	enumChanges := compareEnums(prevFileDesc, currFileDesc)
+	allBreakingChanges = append(allBreakingChanges, enumChanges...)
 
-	// Create maps of files by package
-	prevFilesByPackage := make(map[string][]protoreflect.FileDescriptor)
-	currFilesByPackage := make(map[string][]protoreflect.FileDescriptor)
+	// Compare services
+	serviceChanges := compareServices(prevFileDesc, currFileDesc)
+	allBreakingChanges = append(allBreakingChanges, serviceChanges...)
 
-	prevFiles.RangeFiles(func(file protoreflect.FileDescriptor) bool {
-		pkg := string(file.Package())
-		prevFilesByPackage[pkg] = append(prevFilesByPackage[pkg], file)
-		return true
-	})
+	return allBreakingChanges, nil
+}
 
-	currFiles.RangeFiles(func(file protoreflect.FileDescriptor) bool {
-		pkg := string(file.Package())
-		currFilesByPackage[pkg] = append(currFilesByPackage[pkg], file)
-		return true
-	})
+func main() {
+	// Define command-line flags
+	compareCommitFlag := flag.String("commit", "HEAD", "Git commit to compare against (default: HEAD)")
+	helpFlag := flag.Bool("help", false, "Show help message")
+	flag.Parse()
 
-	// Compare files by package
-	for pkg, prevFileList := range prevFilesByPackage {
-		currFileList, ok := currFilesByPackage[pkg]
-		if !ok {
-			// Package was removed
-			for _, prevFile := range prevFileList {
-				allBreakingChanges = append(allBreakingChanges,
-					fmt.Sprintf("Package %q was removed (file: %s)", pkg, prevFile.Path()))
-			}
+	// Show help message if requested
+	if *helpFlag {
+		fmt.Println("Proto Breaking Change Detector")
+		fmt.Println("Automatically detects breaking changes in Protocol Buffer files")
+		fmt.Println("")
+		fmt.Println("Usage:")
+		fmt.Println("  go run main.go [options]")
+		fmt.Println("")
+		fmt.Println("Options:")
+		flag.PrintDefaults()
+		fmt.Println("")
+		fmt.Println("Examples:")
+		fmt.Println("  go run main.go                   # Compare with HEAD (current state vs. last commit)")
+		fmt.Println("  go run main.go --commit HEAD~1   # Compare with the commit before the last one")
+		fmt.Println("  go run main.go --commit abc123   # Compare with a specific commit hash")
+		os.Exit(0)
+	}
+
+	// No need to check for protoc installation since we're using protoparse directly
+
+	// Get modified proto files
+	modifiedProtoFiles, err := getModifiedProtoFiles(*compareCommitFlag)
+	if err != nil {
+		fmt.Printf("Error getting modified proto files: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(modifiedProtoFiles) == 0 {
+		fmt.Println("No modified proto files found")
+		os.Exit(0)
+	}
+
+	fmt.Printf("Found %d modified proto files compared to %s\n", len(modifiedProtoFiles), *compareCommitFlag)
+
+	// Process each modified proto file
+	hasBreakingChanges := false
+	for _, protoFile := range modifiedProtoFiles {
+		breakingChanges, err := compareProtoFile(protoFile, *compareCommitFlag)
+		if err != nil {
+			fmt.Printf("Error processing %s: %v\n", protoFile, err)
 			continue
 		}
 
-		// For simplicity, just compare the first file in each package
-		// In a real implementation, you'd need to handle multiple files per package
-		if len(prevFileList) > 0 && len(currFileList) > 0 {
-			prevFile := prevFileList[0]
-			currFile := currFileList[0]
-
-			fmt.Printf("Comparing files: %s and %s (package: %s)\n",
-				prevFile.Path(), currFile.Path(), pkg)
-
-			// Compare messages, enums, and services
-			msgChanges := compareMessages(prevFile, currFile)
-			enumChanges := compareEnums(prevFile, currFile)
-			serviceChanges := compareServices(prevFile, currFile)
-			allBreakingChanges = append(allBreakingChanges, msgChanges...)
-			allBreakingChanges = append(allBreakingChanges, enumChanges...)
-			allBreakingChanges = append(allBreakingChanges, serviceChanges...)
+		// Print results for this file
+		if len(breakingChanges) == 0 {
+			fmt.Printf("✅ No breaking changes detected in %s\n", protoFile)
+		} else {
+			hasBreakingChanges = true
+			fmt.Printf("🔴 Detected %d breaking changes in %s:\n", len(breakingChanges), protoFile)
+			for _, change := range breakingChanges {
+				fmt.Printf("  - %s\n", change)
+			}
 		}
 	}
 
-	// Print results
-	if len(allBreakingChanges) == 0 {
-		fmt.Println("✅ No breaking changes detected")
-	} else {
-		fmt.Printf("🔴 Detected %d breaking changes:\n", len(allBreakingChanges))
-		for _, change := range allBreakingChanges {
-			fmt.Printf("  - %s\n", change)
-		}
+	// Exit with error code if breaking changes were found
+	if hasBreakingChanges {
+		os.Exit(1)
 	}
 }
